@@ -50,15 +50,20 @@ scraper_config.example.yaml # Шаблон конфигурации
 │  5. scroll_table_to_end()  ← Прокрутка виртуальной таблицы до конца      │
 │  6. for each row:                                                         │
 │       a. row.click()       ← Клик на строку → открытие диалога           │
-│       b. parse_student_dialog()                                           │
-│          ├─ ФИО из хедера  (.student_dialog__header-info)                │
+│       b. Ожидание диалога  ← 5 попыток × 2с (div.cursor-pointer)        │
+│          └─ Если не загрузился → Escape → continue (следующий студент)   │
+│       c. parse_student_dialog()                                           │
+│          ├─ ФИО из хедера  (div.cursor-pointer.text-center)              │
 │          ├─ ID, email      (.student_dialog__menu-footer__*)             │
-│          ├─ Сканы док-тов  (square-check / square-x icons)               │
+│          ├─ Сканы док-тов  ← Проверка input.q-field__native              │
+│          │   └─ Если файл есть → клик open_in_new → новая вкладка        │
+│          │       → fetch() через page.evaluate → ContentFile → DB        │
 │          ├─ Клик «Учет»    (вторая вкладка tabs-list)                    │
-│          ├─ Статусы док-тов (Заявление, Согласие — по иконкам)           │
+│          ├─ Статусы док-тов (Заявление, Согласие — по input value)       │
 │          └─ Метаданные     (Статус, Оператор, Даты)                      │
-│       c. on_student() → save_student_to_db() → update_or_create          │
-│       d. Закрыть диалог (Escape / кнопка close)                          │
+│       d. save_student_to_db() → update_or_create + FileField.save()      │
+│       e. Закрыть диалог (Escape)                                         │
+│       f. wait_for_selector(tbody, visible) + 500мс ← ожидание таблицы    │
 │  7. browser.close()                                                       │
 └──────────────────────────────────────────────────────────────────────────┘
 ```
@@ -107,9 +112,9 @@ Student (1) ─── OneToOne ─── (1) EnrollmentRoute
 | `last_name` | `.student_dialog__header-info .cursor-pointer` | Первое слово из полного ФИО |
 | `first_name` |同上 | Второе слово из полного ФИО |
 | `patronymic` |同上 | Остальные слова (если есть) |
-| `has_passport_scan` | Строка "Скан паспорт*" → `square-check` | Есть иконка ✓ → True |
-| `has_name_change_scan` | Строка "Скан документа о смене ФИО" → `square-check` | Есть иконка ✓ → True |
-| `has_education_scan` | Строка "Скан документа об образовании" → `square-check` | Есть иконка ✓ → True |
+| `passport_file` | Строка "Скан паспорт*" → `input.q-field__native` | Скачивание PDF через новую вкладку (`open_in_new` icon) → `fetch()` в `page.evaluate` → `ContentFile` |
+| `name_change_file` | Строка "Скан документа о смене ФИО" → `input.q-field__native` | Аналогично `passport_file` |
+| `education_file` | Строка "Скан документа об образовании" → `input.q-field__native` | Аналогично `passport_file` |
 
 #### EnrollmentRoute
 
@@ -213,6 +218,14 @@ python manage.py run_scraper
 python manage.py run_scraper --config /path/to/config.yaml
 ```
 
+#### Тестовый режим (первые 10 записей):
+
+```bash
+python manage.py run_scraper --test
+```
+
+Флаг `--test` ограничивает обработку первыми 10 студентами из таблицы. Удобно для отладки и проверки конфигурации перед полным запуском.
+
 #### Один студент по ID:
 
 ```bash
@@ -273,18 +286,19 @@ def _map_route_status(raw_status: str) -> str:
     return mapping.get(raw_status.strip().lower(), "new")
 ```
 
-### Изменение логики определения сканов
+### Изменение логики скачивания документов
 
-**Файл:** `parser/scraper.py`, функция `_has_check_icon()`
+**Файл:** `parser/scraper.py`, функции `_check_file_input_has_value()`, `_download_file_from_row()`
 
-Определяет наличие документа по иконке `square-check.svg`:
+Скачивание PDF работает по следующему алгоритму:
 
-```python
-def _has_check_icon(dialog, title_text: str) -> bool:
-    # Ищет строку с заданным заголовком и проверяет наличие square-check
-```
-
-Если платформа изменит иконки — обновите селектор `img[src*="square-check"]`.
+1. Проверка `input.q-field__native` — если значение "Выбрать" или пустое, файл отсутствует
+2. Поиск иконки `open_in_new` внутри той же строки `.student_info__row`
+3. Клик по иконке с перехватом новой вкладки через `page.context.expect_page()`
+4. Получение URL PDF из `pdf_page.url`
+5. Скачивание байтов через `fetch()` внутри `page.evaluate()` (сохраняет куки авторизации)
+6. Закрытие PDF-вкладки: `pdf_page.close()`
+7. Сохранение в Django через `student.passport_file.save(name, ContentFile(bytes))`
 
 ### Извлечение дополнительных полей
 

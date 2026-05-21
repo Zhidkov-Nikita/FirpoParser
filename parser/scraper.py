@@ -527,37 +527,11 @@ def _map_route_status(raw_status: str) -> str:
 
 def parse_student_dialog(page: Page, config: Dict[str, Any]) -> Optional[StudentData]:
     """
-    Parses the open student dialog using dynamic polling and strict selectors.
-
-    Polling: up to 6 attempts (2s each) waiting for div.cursor-pointer.text-center.
+    Parses the open student dialog. Assumes dialog is already loaded and visible.
+    Called after the main loop confirms dialog readiness via polling.
     """
-    # --- Dynamic polling: wait for full_name element to appear ---
     full_name_selector = "div.cursor-pointer.text-center"
-    max_attempts = 6
-    poll_interval = 2  # seconds
 
-    for attempt in range(1, max_attempts + 1):
-        try:
-            el = page.query_selector(full_name_selector)
-            if el:
-                text = el.inner_text().strip()
-                if text:
-                    break
-        except Exception:
-            pass
-
-        if attempt < max_attempts:
-            page.wait_for_timeout(poll_interval * 1000)
-    else:
-        print("[scraper] Dialog did not load (full_name not found after 12s). Closing.")
-        try:
-            page.keyboard.press("Escape")
-            page.wait_for_timeout(5000)
-        except Exception:
-            pass
-        return None
-
-    # --- Dialog is ready, parse data ---
     data = StudentData()
 
     try:
@@ -673,6 +647,7 @@ def parse_student_dialog(page: Page, config: Dict[str, Any]) -> Optional[Student
 def run_scraper(
     config_path: str = "scraper_config.yaml",
     *,
+    test_mode: bool = False,
     on_student: Optional[Callable[[StudentData], None]] = None,
 ) -> List[StudentData]:
     """
@@ -684,10 +659,11 @@ def run_scraper(
        a. cell = page.locator("table.q-table td").filter(has_text=email).first
        b. cell.scroll_into_view_if_needed()
        c. cell.click()
-       d. parse_student_dialog() (polling up to 12s)
-       e. save_student_to_db(data)  ← direct sync Django ORM call
-       f. page.keyboard.press("Escape")
-       g. wait_for_selector(tbody, state='visible') + 500ms  ← dynamic table reload
+       d. Wait for dialog (5 attempts, 2s each)
+       e. parse_student_dialog() (dialog already confirmed loaded)
+       f. save_student_to_db(data)  ← direct sync Django ORM call
+       g. page.keyboard.press("Escape")
+       h. wait_for_selector(tbody, state='visible') + 500ms  ← dynamic table reload
     """
     # Allow sync ORM calls from Playwright's sync context
     import os
@@ -725,6 +701,12 @@ def run_scraper(
 
         # --- Collect unique emails ---
         emails = collect_unique_emails(page, config)
+
+        # --- Test mode: limit to first 10 students ---
+        if test_mode:
+            print("[scraper] Running in TEST mode. Processing only the first 10 students.")
+            emails = emails[:10]
+
         total = len(emails)
 
         if total == 0:
@@ -750,20 +732,46 @@ def run_scraper(
                 # Step 3: Click the cell
                 cell.click()
 
-                # Step 4: Parse dialog (internal polling: up to 12s waiting for full_name)
+                # Step 4: Wait for dialog to load — exactly 5 attempts per student
+                dialog_loaded = False
+                for attempt in range(1, 6):
+                    print(f"[scraper] [{idx + 1}/{total}] Checking dialog load. Attempt {attempt}/5...")
+                    try:
+                        if page.locator("div.cursor-pointer.text-center").is_visible():
+                            dialog_loaded = True
+                            break
+                    except Exception:
+                        pass
+                    if attempt < 5:
+                        page.wait_for_timeout(2000)
+
+                if not dialog_loaded:
+                    print(f"[scraper] [{idx + 1}/{total}] Dialog did not load after 5 attempts. Skipping this student.")
+                    try:
+                        page.keyboard.press("Escape")
+                        page.wait_for_selector("tbody.q-virtual-scroll__content", state="visible", timeout=10000)
+                        page.wait_for_timeout(500)
+                    except Exception:
+                        pass
+                    continue
+
+                # Step 5: Parse dialog (already confirmed loaded)
                 student_data = parse_student_dialog(page, config)
 
                 if student_data is None:
                     print(
                         f"[scraper] [{idx + 1}/{total}] "
-                        f"Skipped (dialog did not load). Email: {email}"
+                        f"Skipped (dialog parse returned None). Email: {email}"
                     )
+                    page.keyboard.press("Escape")
+                    page.wait_for_selector("tbody.q-virtual-scroll__content", state="visible", timeout=10000)
+                    page.wait_for_timeout(500)
                     continue
 
                 if student_data and student_data.first_name:
                     students.append(student_data)
 
-                    # Step 5: Save to Django DB — direct sync call
+                    # Step 6: Save to Django DB
                     try:
                         student_obj, route_obj, created = save_student_to_db(student_data)
                         action = "Created" if created else "Updated"
@@ -782,10 +790,10 @@ def run_scraper(
                         f"Skipped (no name in dialog). Email: {email}"
                     )
 
-                # Step 6: Close dialog via Escape
+                # Step 7: Close dialog via Escape
                 page.keyboard.press("Escape")
 
-                # Step 7: Dynamic wait for table to reload (replaces hardcoded 5s)
+                # Step 8: Dynamic wait for table to reload
                 print("[scraper] Waiting for virtual scroll content to reload and stabilize...")
                 page.wait_for_selector(
                     "tbody.q-virtual-scroll__content",
@@ -888,6 +896,27 @@ def run_scraper_single(
         cell.scroll_into_view_if_needed()
         page.wait_for_timeout(300)
         cell.click()
+
+        # Wait for dialog to load — exactly 5 attempts
+        dialog_loaded = False
+        for attempt in range(1, 6):
+            print(f"[scraper] Checking dialog load. Attempt {attempt}/5...")
+            try:
+                if page.locator("div.cursor-pointer.text-center").is_visible():
+                    dialog_loaded = True
+                    break
+            except Exception:
+                pass
+            if attempt < 5:
+                page.wait_for_timeout(2000)
+
+        if not dialog_loaded:
+            print("[scraper] Dialog did not load after 5 attempts.")
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+            return None
 
         student_data = parse_student_dialog(page, config)
 

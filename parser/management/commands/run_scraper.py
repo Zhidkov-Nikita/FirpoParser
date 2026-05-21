@@ -13,10 +13,19 @@ class Command(BaseCommand):
             default="scraper_config.yaml",
             help="Путь к YAML-конфигу скрапера",
         )
+        parser.add_argument(
+            "--test",
+            action="store_true",
+            default=False,
+            help="Режим теста: обрабатывает только первые 10 студентов",
+        )
 
     def handle(self, *args, **options):
         config_path = options["config"]
+        test_mode = options["test"]
         self.stdout.write(f"[scraper] Config: {config_path}")
+        if test_mode:
+            self.stdout.write(self.style.WARNING("[scraper] TEST MODE: first 10 students only"))
 
         created = 0
         updated = 0
@@ -37,7 +46,7 @@ class Command(BaseCommand):
                     f"  ERROR: {data.last_name} {data.first_name}: {e}"
                 )
 
-        students = run_scraper(config_path=config_path, on_student=on_student)
+        students = run_scraper(config_path=config_path, test_mode=test_mode, on_student=on_student)
         total = len(students)
 
         self.stdout.write(self.style.SUCCESS(
