@@ -1,0 +1,8 @@
+scraper_config.yaml
+*.pdf
+venv/
+.venv/
+env/
+.env/
+staticfiles/
+static_root/

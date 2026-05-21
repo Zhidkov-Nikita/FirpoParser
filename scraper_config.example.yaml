@@ -1,0 +1,91 @@
+# ============================================================
+# Конфигурация скрапера платформы ИРПО (https://firpo.ru)
+# ============================================================
+# Скопируйте этот файл в scraper_config.yaml и заполните
+# реальные учетные данные.
+#
+# cp scraper_config.example.yaml scraper_config.yaml
+# ============================================================
+
+auth:
+  # URL страницы входа в админ-панель
+  login_url: "https://edu.firpo.ru/admin-login"
+
+  # Учетные данные
+  email: "your_email@example.com"
+  password: "your_password"
+
+  # Селекторы полей формы (Quasar q-input с aria-label)
+  email_selector: "input[aria-label='Электронная почта']"
+  password_selector: "input[aria-label='Пароль']"
+
+  # Кнопка входа (type="button", НЕ submit)
+  submit_selector: "button.login-button"
+
+  # Маркер успешной авторизации:
+  # URL, на который должен перейти браузер после входа.
+  # Если указан — парсер ждёт перехода на этот URL (или его подстроку).
+  # Если пустой — используется success_selector.
+  success_url: "/admin"
+
+  # CSS-селектор элемента, подтверждающего вход (fallback, если success_url не задан)
+  success_selector: ".q-page"
+
+  # Таймаут ожидания авторизации (миллисекунды)
+  login_timeout: 30000
+
+pages:
+  # URL страницы слушателей (куда переходим после авторизации)
+  students_page_url: "https://edu.firpo.ru/jM5a-1Pq8/students"
+
+  # Максимальное время загрузки страницы студентов (мс)
+  students_page_timeout: 60000
+
+  # --- LocalStorage preset ---
+  # Ключ в localStorage, который управляет лимитом отображения строк
+  localstorage_preset_key: "preset-students30-students30-all-last"
+  # Значение — количество строк (1184 = все слушатели)
+  localstorage_preset_value: "1184"
+
+table:
+  # Селектор контейнера виртуального скролла Quasar
+  scroll_container_selector: "tbody.q-virtual-scroll__content"
+
+  # Селектор строки таблицы
+  row_selector: "tbody.q-virtual-scroll__content tr"
+
+  # Максимальное количество итераций прокрутки
+  max_scroll_iterations: 50
+
+  # Задержка между прокрутками (секунды)
+  scroll_delay: 0.5
+
+  # Задержка перед кликом на строку (мс) — чтобы DOM стабилизировался
+  row_click_delay: 200
+
+dialog:
+  # Селектор модального окна (частичное совпадение класса Quasar portal)
+  selector: "div[class*='q-portal--dialog']"
+
+  # Таймаут ожидания появления диалога (мс)
+  timeout: 15000
+
+  # Задержка после открытия диалога перед парсингом (мс)
+  parse_delay: 500
+
+  # Задержка после закрытия диалога (мс)
+  close_delay: 300
+
+browser:
+  # Путь до системного Chromium (обязательно для Ubuntu)
+  binary_path: "/usr/bin/chromium-browser"
+
+  # Запуск в headless-режиме (true для сервера, false для отладки)
+  headless: true
+
+  # User-Agent (опционально, для маскировки)
+  # user_agent: "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 ..."
+
+  # Разрешение окна браузера
+  viewport_width: 1920
+  viewport_height: 1080
