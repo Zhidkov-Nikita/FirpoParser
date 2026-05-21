@@ -1,91 +1,126 @@
 from django.contrib import admin
-from .models import Student, EnrollmentRoute
+from .models import (
+    Student,
+    CourseEnrollment,
+    PersonalDataConsent,
+    EnrollmentApplication,
+    EducationContract,
+    PrimaryDocuments,
+)
 
 
-class EnrollmentRouteInline(admin.StackedInline):
-    """
-    Позволяет редактировать и видеть маршрут учета 
-    прямо внутри карточки обучаемого.
-    """
-    model = EnrollmentRoute
+class RouteDocumentInlineBase(admin.StackedInline):
+    """Базовый класс для инлайнов документов маршрута."""
+    extra = 0
     can_delete = False
-    verbose_name = "Маршрут учета (Документы и Статусы)"
-    verbose_name_plural = "Маршрут учета (Документы и Статусы)"
-    fieldsets = (
-        ('Первичные документы', {
-            'fields': ('has_enrollment_application', 'has_personal_data_consent')
-        }),
-        ('Статус и проверка', {
-            'fields': ('status', 'uploaded_at', 'operator', 'verified_at')
-        }),
-    )
+    fields = ('is_checked', 'date_text', 'operator')
+    readonly_fields = ('date_text', 'operator')
+
+
+class CourseEnrollmentInline(RouteDocumentInlineBase):
+    model = CourseEnrollment
+    verbose_name = "Поступление на курс"
+    verbose_name_plural = "Поступление на курс"
+
+
+class PersonalDataConsentInline(RouteDocumentInlineBase):
+    model = PersonalDataConsent
+    verbose_name = "Согласие на обработку ПДн"
+    verbose_name_plural = "Согласие на обработку ПДн"
+
+
+class EnrollmentApplicationInline(RouteDocumentInlineBase):
+    model = EnrollmentApplication
+    verbose_name = "Заявление на зачисление"
+    verbose_name_plural = "Заявление на зачисление"
+
+
+class EducationContractInline(RouteDocumentInlineBase):
+    model = EducationContract
+    verbose_name = "Договор на обучение"
+    verbose_name_plural = "Договор на обучение"
+
+
+class PrimaryDocumentsInline(RouteDocumentInlineBase):
+    model = PrimaryDocuments
+    verbose_name = "Первичные документы"
+    verbose_name_plural = "Первичные документы"
 
 
 @admin.register(Student)
 class StudentAdmin(admin.ModelAdmin):
-    """
-    Настройка отображения обучаемых в админ-панели.
-    """
-    # Колоки в общем списке студентов
     list_display = (
-        'get_full_name', 
-        'get_status', 
-        'has_passport_file', 
-        'has_name_change_file', 
-        'has_education_file', 
-        'get_uploaded_at'
+        'student_id',
+        'get_full_name',
+        'email',
+        'course',
+        'has_passport_file',
+        'has_education_file',
     )
-    
-    # Фильтры в правой панели для быстрого поиска
     list_filter = (
-        'route__status', 
-        'passport_file', 
-        'education_file', 
-        'route__uploaded_at'
+        'passport_file',
+        'education_file',
+        'name_change_file',
     )
-    
-    # Поля, по которым работает поиск
-    search_fields = ('last_name', 'first_name', 'patronymic', 'route__operator')
-    
-    # Инлайны (подключение маршрута на страницу студента)
-    inlines = [EnrollmentRouteInline]
+    search_fields = (
+        'student_id',
+        'last_name',
+        'first_name',
+        'patronymic',
+        'email',
+    )
+    inlines = [
+        CourseEnrollmentInline,
+        PersonalDataConsentInline,
+        EnrollmentApplicationInline,
+        EducationContractInline,
+        PrimaryDocumentsInline,
+    ]
+    readonly_fields = ('created_at', 'updated_at')
 
-    # Кастомные методы для вывода данных из связанной модели Route в список Студентов
-    @admin.display(description='ФИО Обучаемого')
+    @admin.display(description='ФИО')
     def get_full_name(self, obj):
         return f"{obj.last_name} {obj.first_name} {obj.patronymic or ''}".strip()
-
-    @admin.display(description='Статус', ordering='route__status')
-    def get_status(self, obj):
-        if hasattr(obj, 'route'):
-            return obj.route.get_status_display()
-        return 'Нет маршрута'
-
-    @admin.display(description='Дата подгрузки', ordering='route__uploaded_at')
-    def get_uploaded_at(self, obj):
-        if hasattr(obj, 'route'):
-            return obj.route.uploaded_at.strftime('%d.%m.%Y %H:%M')
-        return '-'
 
     @admin.display(description='Паспорт', boolean=True)
     def has_passport_file(self, obj):
         return bool(obj.passport_file)
-
-    @admin.display(description='Смена ФИО', boolean=True)
-    def has_name_change_file(self, obj):
-        return bool(obj.name_change_file)
 
     @admin.display(description='Образование', boolean=True)
     def has_education_file(self, obj):
         return bool(obj.education_file)
 
 
-@admin.register(EnrollmentRoute)
-class EnrollmentRouteAdmin(admin.ModelAdmin):
-    """
-    Отдельный интерфейс для маршрутов (если нужно посмотреть только статусы).
-    """
-    list_display = ('student', 'status', 'uploaded_at', 'operator', 'verified_at')
-    list_filter = ('status', 'uploaded_at', 'verified_at')
-    search_fields = ('student__last_name', 'operator')
-    readonly_fields = ('uploaded_at',)  # Запрещаем случайное изменение даты загрузки вручную
+@admin.register(CourseEnrollment)
+class CourseEnrollmentAdmin(admin.ModelAdmin):
+    list_display = ('student', 'is_checked', 'date_text', 'operator')
+    list_filter = ('is_checked',)
+    search_fields = ('student__last_name', 'student__first_name', 'operator')
+
+
+@admin.register(PersonalDataConsent)
+class PersonalDataConsentAdmin(admin.ModelAdmin):
+    list_display = ('student', 'is_checked', 'date_text', 'operator')
+    list_filter = ('is_checked',)
+    search_fields = ('student__last_name', 'student__first_name', 'operator')
+
+
+@admin.register(EnrollmentApplication)
+class EnrollmentApplicationAdmin(admin.ModelAdmin):
+    list_display = ('student', 'is_checked', 'date_text', 'operator')
+    list_filter = ('is_checked',)
+    search_fields = ('student__last_name', 'student__first_name', 'operator')
+
+
+@admin.register(EducationContract)
+class EducationContractAdmin(admin.ModelAdmin):
+    list_display = ('student', 'is_checked', 'date_text', 'operator')
+    list_filter = ('is_checked',)
+    search_fields = ('student__last_name', 'student__first_name', 'operator')
+
+
+@admin.register(PrimaryDocuments)
+class PrimaryDocumentsAdmin(admin.ModelAdmin):
+    list_display = ('student', 'is_checked', 'date_text', 'operator')
+    list_filter = ('is_checked',)
+    search_fields = ('student__last_name', 'student__first_name', 'operator')

@@ -1,3 +1,4 @@
+import traceback
 from django.core.management.base import BaseCommand
 from parser.scraper import run_scraper
 from parser.services import save_student_to_db
@@ -35,7 +36,7 @@ class Command(BaseCommand):
         def on_student(data):
             nonlocal created, updated, errors
             try:
-                student, route, was_created = save_student_to_db(data)
+                student, was_created = save_student_to_db(data)
                 if was_created:
                     created += 1
                 else:
@@ -45,9 +46,15 @@ class Command(BaseCommand):
                 self.stderr.write(
                     f"  ERROR: {data.last_name} {data.first_name}: {e}"
                 )
+                traceback.print_exc()
 
-        students = run_scraper(config_path=config_path, test_mode=test_mode, on_student=on_student)
-        total = len(students)
+        try:
+            students = run_scraper(config_path=config_path, test_mode=test_mode, on_student=on_student)
+            total = len(students)
+        except Exception as e:
+            self.stderr.write(self.style.ERROR(f"[scraper] Critical scraper failure: {e}"))
+            traceback.print_exc()
+            return
 
         self.stdout.write(self.style.SUCCESS(
             f"Done! Total: {total}, Created: {created}, "

@@ -1,3 +1,4 @@
+import traceback
 from django.core.management.base import BaseCommand
 from parser.scraper import run_scraper_single
 from parser.services import save_student_to_db
@@ -26,16 +27,23 @@ class Command(BaseCommand):
 
         self.stdout.write(f"[scraper] Config: {config_path}, Student ID: {student_id or 'first'}")
 
-        data = run_scraper_single(config_path=config_path, student_id=student_id)
+        try:
+            data = run_scraper_single(config_path=config_path, student_id=student_id)
+        except Exception as e:
+            self.stderr.write(self.style.ERROR(f"[scraper] Critical scraper failure: {e}"))
+            traceback.print_exc()
+            return
+
         if data is None:
             self.stdout.write(self.style.WARNING("No data received."))
             return
 
         try:
-            student, route, was_created = save_student_to_db(data)
+            student, was_created = save_student_to_db(data)
             action = "Created" if was_created else "Updated"
             self.stdout.write(self.style.SUCCESS(
-                f"{action}: {student} (Route: {route.get_status_display()})"
+                f"{action}: {student}"
             ))
         except Exception as e:
             self.stderr.write(self.style.ERROR(f"Error: {e}"))
+            traceback.print_exc()

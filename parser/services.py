@@ -1,44 +1,44 @@
 """
-Пайплайн сохранения данных скрапера в Django-модели Student и EnrollmentRoute.
+Пайплайн сохранения данных скрапера в Django-модели.
 
-Использует update_or_create для идемпотентности: повторный запуск обновляет
-существующие записи, а не создаёт дубликаты.
+Сохраняет Student + 5 моделей документов маршрута через update_or_create.
 """
 
-from datetime import datetime
 from typing import Optional
 
 from django.core.files.base import ContentFile
 from django.db import transaction
-from django.utils.timezone import make_aware, now
 
-from .models import Student, EnrollmentRoute
-from .scraper import StudentData
-
-
-def _ensure_aware(dt: Optional[datetime]) -> Optional[datetime]:
-    if dt is None:
-        return None
-    if dt.tzinfo is None:
-        return make_aware(dt)
-    return dt
+from .models import (
+    Student,
+    CourseEnrollment,
+    PersonalDataConsent,
+    EnrollmentApplication,
+    EducationContract,
+    PrimaryDocuments,
+)
+from .scraper import StudentData, ROUTE_MODEL_MAPPING
 
 
 def save_student_to_db(data: StudentData) -> tuple:
     """
-    Сохраняет одного студента и его маршрут в БД.
-
-    Lookup key: (last_name, first_name).
-    Использует update_or_create для Student, затем update_or_create для EnrollmentRoute.
-    Сохраняет PDF-файлы документов через ContentFile.
+    Сохраняет студента и все документы маршрута в БД.
 
     Returns:
-        (student, route, created) — кортеж созданных/обновлённых объектов и флаг создания.
+        (student, created) — объект студента и флаг создания.
     """
     if not data.first_name or not data.last_name:
         raise ValueError(
             f"Cannot save student without name: last_name={data.last_name!r}, first_name={data.first_name!r}"
         )
+
+    MODEL_CLASS_MAP = {
+        "CourseEnrollment": CourseEnrollment,
+        "PersonalDataConsent": PersonalDataConsent,
+        "EnrollmentApplication": EnrollmentApplication,
+        "EducationContract": EducationContract,
+        "PrimaryDocuments": PrimaryDocuments,
+    }
 
     with transaction.atomic():
         student, student_created = Student.objects.update_or_create(
@@ -46,6 +46,9 @@ def save_student_to_db(data: StudentData) -> tuple:
             first_name=data.first_name,
             defaults={
                 "patronymic": data.patronymic,
+                "student_id": data.student_id or "",
+                "email": data.email or "",
+                "course": data.course or "",
             },
         )
 
@@ -70,44 +73,22 @@ def save_student_to_db(data: StudentData) -> tuple:
                 save=True,
             )
 
-        uploaded_at = _ensure_aware(data.uploaded_at) or now()
-        verified_at = _ensure_aware(data.verified_at)
+        for route_doc in data.route_documents:
+            model_name = ROUTE_MODEL_MAPPING.get(route_doc.name)
+            if not model_name:
+                continue
 
-        route, route_created = EnrollmentRoute.objects.update_or_create(
-            student=student,
-            defaults={
-                "status": data.route_status,
-                "uploaded_at": uploaded_at,
-                "has_enrollment_application": data.has_enrollment_application,
-                "has_personal_data_consent": data.has_personal_data_consent,
-                "operator": data.operator,
-                "verified_at": verified_at,
-            },
-        )
+            model_cls = MODEL_CLASS_MAP.get(model_name)
+            if not model_cls:
+                continue
 
-    return student, route, student_created
+            model_cls.objects.update_or_create(
+                student=student,
+                defaults={
+                    "is_checked": route_doc.is_checked,
+                    "date_text": route_doc.date_text,
+                    "operator": route_doc.operator,
+                },
+            )
 
-
-def save_students_batch(students: list[StudentData]) -> dict:
-    """
-    Пакетное сохранение списка студентов.
-
-    Returns:
-        dict с ключами: created, updated, errors.
-    """
-    created = 0
-    updated = 0
-    errors = []
-
-    for data in students:
-        try:
-            student, route, was_created = save_student_to_db(data)
-            if was_created:
-                created += 1
-            else:
-                updated += 1
-        except Exception as e:
-            name = f"{data.last_name} {data.first_name}"
-            errors.append({"name": name, "error": str(e)})
-
-    return {"created": created, "updated": updated, "errors": errors}
+    return student, student_created

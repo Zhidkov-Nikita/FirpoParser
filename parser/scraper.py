@@ -2,15 +2,16 @@
 Playwright-based scraper for FIRPO Edu platform (Quasar SPA).
 
 Target: https://edu.firpo.ru/jM5a-1Pq8/students
-Extracts student personal info and enrollment route data from dialog windows.
+Extracts student personal info, downloads PDF documents, and parses
+the "Маршрут" tab for enrollment route data.
 
 Uses synchronous Playwright API (sync_api) + direct Django ORM calls.
 """
 
 import re
 import time
+import traceback
 from dataclasses import dataclass, field
-from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -18,7 +19,6 @@ import yaml
 from playwright.sync_api import (
     sync_playwright,
     Page,
-    Browser,
     BrowserContext,
     TimeoutError as PwTimeoutError,
 )
@@ -27,6 +27,15 @@ from playwright.sync_api import (
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
+
+@dataclass
+class RouteDocumentData:
+    """Data extracted from a single row in the Маршрут table."""
+    name: str = ""
+    is_checked: bool = False
+    date_text: Optional[str] = None
+    operator: Optional[str] = None
+
 
 @dataclass
 class StudentData:
@@ -38,10 +47,6 @@ class StudentData:
     first_name: Optional[str] = None
     patronymic: Optional[str] = None
 
-    has_passport_scan: bool = False
-    has_name_change_scan: bool = False
-    has_education_scan: bool = False
-
     passport_file_name: Optional[str] = None
     passport_file_bytes: Optional[bytes] = None
 
@@ -51,14 +56,7 @@ class StudentData:
     education_file_name: Optional[str] = None
     education_file_bytes: Optional[bytes] = None
 
-    has_enrollment_application: bool = False
-    has_personal_data_consent: bool = False
-
-    route_status: str = "new"
-    uploaded_at: Optional[datetime] = None
-    operator: Optional[str] = None
-    verified_at: Optional[datetime] = None
-
+    route_documents: List[RouteDocumentData] = field(default_factory=list)
     raw_fields: Dict[str, str] = field(default_factory=dict)
 
 
@@ -75,30 +73,46 @@ def load_config(path: str = "scraper_config.yaml") -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Django ORM save (direct sync call — no sync_to_async needed)
+# Django ORM save
 # ---------------------------------------------------------------------------
+
+ROUTE_MODEL_MAPPING = {
+    "Поступление на курс": "CourseEnrollment",
+    "Согласие на обработку персональных данных": "PersonalDataConsent",
+    "Заявление на зачисление": "EnrollmentApplication",
+    "Договор на обучение": "EducationContract",
+    "Первичные документы": "PrimaryDocuments",
+}
+
 
 def save_student_to_db(data: StudentData):
     """
-    Saves Student + EnrollmentRoute to Django DB.
+    Saves Student + all 5 route document models to Django DB.
     Handles FileField for document scans via ContentFile.
     """
     from django.core.files.base import ContentFile
     from django.db import transaction
-    from django.utils.timezone import make_aware, now
-    from parser.models import Student, EnrollmentRoute
+    from parser.models import (
+        Student,
+        CourseEnrollment,
+        PersonalDataConsent,
+        EnrollmentApplication,
+        EducationContract,
+        PrimaryDocuments,
+    )
+
+    MODEL_CLASS_MAP = {
+        "CourseEnrollment": CourseEnrollment,
+        "PersonalDataConsent": PersonalDataConsent,
+        "EnrollmentApplication": EnrollmentApplication,
+        "EducationContract": EducationContract,
+        "PrimaryDocuments": PrimaryDocuments,
+    }
 
     if not data.first_name or not data.last_name:
         raise ValueError(
             f"Cannot save without name: last_name={data.last_name!r}, first_name={data.first_name!r}"
         )
-
-    def _ensure_aware(dt):
-        if dt is None:
-            return None
-        if dt.tzinfo is None:
-            return make_aware(dt)
-        return dt
 
     with transaction.atomic():
         student, student_created = Student.objects.update_or_create(
@@ -106,6 +120,9 @@ def save_student_to_db(data: StudentData):
             first_name=data.first_name,
             defaults={
                 "patronymic": data.patronymic,
+                "student_id": data.student_id or "",
+                "email": data.email or "",
+                "course": data.course or "",
             },
         )
 
@@ -130,22 +147,27 @@ def save_student_to_db(data: StudentData):
                 save=True,
             )
 
-        uploaded_at = _ensure_aware(data.uploaded_at) or now()
-        verified_at = _ensure_aware(data.verified_at)
+        for route_doc in data.route_documents:
+            model_name = ROUTE_MODEL_MAPPING.get(route_doc.name)
+            if not model_name:
+                print(f"[scraper] Unknown route document: {route_doc.name}")
+                continue
 
-        route, route_created = EnrollmentRoute.objects.update_or_create(
-            student=student,
-            defaults={
-                "status": data.route_status,
-                "uploaded_at": uploaded_at,
-                "has_enrollment_application": data.has_enrollment_application,
-                "has_personal_data_consent": data.has_personal_data_consent,
-                "operator": data.operator,
-                "verified_at": verified_at,
-            },
-        )
+            model_cls = MODEL_CLASS_MAP.get(model_name)
+            if not model_cls:
+                print(f"[scraper] No model class for: {model_name}")
+                continue
 
-    return student, route, student_created
+            model_cls.objects.update_or_create(
+                student=student,
+                defaults={
+                    "is_checked": route_doc.is_checked,
+                    "date_text": route_doc.date_text,
+                    "operator": route_doc.operator,
+                },
+            )
+
+    return student, student_created
 
 
 # ---------------------------------------------------------------------------
@@ -356,26 +378,18 @@ def collect_unique_emails(page: Page, config: Dict[str, Any]) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# Dialog parsing (sync, strict selectors + polling)
+# Dialog parsing helpers
 # ---------------------------------------------------------------------------
 
 def _parse_full_name(full_name: str):
     parts = full_name.strip().split()
-    if len(parts) >= 3:
-        return parts[0], parts[1], " ".join(parts[2:])
-    elif len(parts) == 2:
-        return parts[0], parts[1], None
-    elif len(parts) == 1:
-        return parts[0], None, None
-    return None, None, None
+    last_name = parts[0] if len(parts) > 0 else "Не указано"
+    first_name = parts[1] if len(parts) > 1 else ""
+    patronymic = " ".join(parts[2:]) if len(parts) > 2 else ""
+    return last_name, first_name, patronymic
 
 
 def _check_file_input_has_value(page: Page, label_text: str) -> bool:
-    """
-    Checks if a file upload row has a real filename in its readonly input.
-
-    Uses: .student_info__row filter(has_text=label_text) → input.q-field__native
-    """
     try:
         row = page.locator(".student_info__row").filter(has_text=label_text).first
         if row.count() == 0:
@@ -395,9 +409,6 @@ def _check_file_input_has_value(page: Page, label_text: str) -> bool:
 
 
 def _get_file_input_value(page: Page, label_text: str) -> Optional[str]:
-    """
-    Returns the filename from the file input row, or None if empty/placeholder.
-    """
     try:
         row = page.locator(".student_info__row").filter(has_text=label_text).first
         if row.count() == 0:
@@ -417,17 +428,6 @@ def _get_file_input_value(page: Page, label_text: str) -> Optional[str]:
 
 
 def _download_file_from_row(page: Page, label_text: str) -> Optional[tuple]:
-    """
-    Downloads a PDF file from a student dialog row.
-
-    Steps:
-    1. Get filename from input.q-field__native
-    2. Find and click the open_in_new icon in the same row
-    3. Intercept the new tab
-    4. Download bytes via fetch() in page.evaluate (preserves auth cookies)
-    5. Close the PDF tab
-    6. Return (filename, bytes)
-    """
     try:
         file_name = _get_file_input_value(page, label_text)
         if not file_name:
@@ -469,6 +469,7 @@ def _download_file_from_row(page: Page, label_text: str) -> Optional[tuple]:
 
     except Exception as e:
         print(f"[scraper] Error downloading '{label_text}': {e}")
+        traceback.print_exc()
         try:
             for p in page.context.pages:
                 if p != page:
@@ -499,60 +500,188 @@ def _extract_field_value(page: Page, title_text: str) -> Optional[str]:
     return None
 
 
-def _parse_datetime(text: Optional[str]) -> Optional[datetime]:
-    if not text:
-        return None
-    text = text.strip()
-    for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%d.%m.%Y"):
+# ---------------------------------------------------------------------------
+# Маршрут tab parsing
+# ---------------------------------------------------------------------------
+
+def _switch_to_route_tab(page: Page, email: str = "") -> bool:
+    """
+    Clicks the second tab (index 1) to switch to "Маршрут".
+    Waits up to 5 attempts (1s each) for the tab to be selected.
+    """
+    tab_selector = (
+        "div.q-item.q-item-type.row.no-wrap.q-item--clickable"
+        ".q-link.cursor-pointer.q-focusable.q-hoverable.col.row.items-center.tabs-item.q-pa-md"
+    )
+
+    tabs = page.query_selector_all(tab_selector)
+    print(f"[DEBUG] Найдено табов: {len(tabs)}")
+    if len(tabs) < 2:
+        print(f"[DEBUG] Недостаточно табов для переключения на Маршрут (найдено: {len(tabs)})")
+        for i, tab in enumerate(tabs):
+            try:
+                txt = tab.inner_text().strip()
+                print(f"[DEBUG]   Таб {i}: '{txt}'")
+            except Exception:
+                print(f"[DEBUG]   Таб {i}: <не удалось прочитать текст>")
+        return False
+
+    print(f"[DEBUG] Кликаю на второй таб (Маршрут) для студента {email}...")
+    try:
+        tabs[1].click()
+        print("[DEBUG] Клик выполнен")
+    except Exception as e:
+        print(f"[DEBUG] Ошибка клика по второму табу: {e}")
+        return False
+
+    page.wait_for_timeout(500)
+
+    for attempt in range(1, 6):
         try:
-            return datetime.strptime(text, fmt)
-        except ValueError:
-            continue
-    return None
+            selected_items = page.query_selector_all("div.student_horizontal__tabs-item.selected")
+            print(f"[DEBUG] Попытка {attempt}: найдено selected элементов: {len(selected_items)}")
+            for item in selected_items:
+                text = item.inner_text().strip()
+                print(f"[DEBUG]   Selected элемент текст: '{text}'")
+                if "маршрут" in text.lower():
+                    print(f"[DEBUG] Успешно переключено! Текст активного таба: '{text}'")
+                    return True
+        except Exception as e:
+            print(f"[DEBUG] Попытка {attempt}: ошибка чтения selected элементов: {e}")
+
+        if attempt < 5:
+            page.wait_for_timeout(1000)
+
+    print("[DEBUG] Маршрут tab не стал активным после 5 попыток")
+    return False
 
 
-def _map_route_status(raw_status: str) -> str:
-    mapping = {
-        "новое": "new",
-        "на проверке": "in_progress",
-        "одобрено": "approved",
-        "отклонено": "rejected",
-        "new": "new",
-        "in_progress": "in_progress",
-        "approved": "approved",
-        "rejected": "rejected",
+def _parse_route_table(page: Page, student_id: str = "") -> List[RouteDocumentData]:
+    """
+    Parses the first 5 rows of the Маршрут table with detailed debug logging.
+    """
+    from parser.models import (
+        CourseEnrollment,
+        EducationContract,
+        EnrollmentApplication,
+        PersonalDataConsent,
+        PrimaryDocuments,
+    )
+
+    results: List[RouteDocumentData] = []
+
+    model_mapping = {
+        "Поступление на курс": CourseEnrollment,
+        "Согласие на обработку персональных данных": PersonalDataConsent,
+        "Заявление на зачисление": EnrollmentApplication,
+        "Договор на обучение": EducationContract,
+        "Первичные документы": PrimaryDocuments,
     }
-    return mapping.get(raw_status.strip().lower(), "new")
 
+    try:
+        rows_count = page.locator("tbody.q-virtual-scroll__content tr").count()
+        print(f"[DEBUG] Всего tr найдено во внутреннем скролле: {rows_count}")
+
+        if rows_count == 0:
+            print("[DEBUG] Нет строк в таблице маршрута")
+            return results
+
+        for idx in range(min(5, rows_count)):
+            print(f"--- Обработка строки {idx + 1} из 5 ---")
+            try:
+                nth = idx + 1
+
+                # Столбец 1: Название документа
+                doc_title_selector = f"tbody.q-virtual-scroll__content tr:nth-child({nth}) td:nth-child(1) div.student_table__field-value"
+                doc_title_el = page.locator(doc_title_selector)
+                doc_title = doc_title_el.text_content().strip() if doc_title_el.count() > 0 else ""
+                print(f"[DEBUG] Столбец 1 (Название документа): '{doc_title}'")
+
+                # Столбец 2: Картинка статуса
+                img_selector = f"tbody.q-virtual-scroll__content tr:nth-child({nth}) td:nth-child(2) img"
+                img_element = page.locator(img_selector)
+                img_src = img_element.get_attribute("src") if img_element.count() > 0 else "НЕТ_КАРТИНКИ"
+                print(f"[DEBUG] Столбец 2 (src картинки): '{img_src}'")
+                is_checked = "check" in img_src.lower() if img_src != "НЕТ_КАРТИНКИ" else False
+
+                # Столбец 3: Дата
+                date_selector = f"tbody.q-virtual-scroll__content tr:nth-child({nth}) td:nth-child(3) div.student_table__field-value"
+                date_el = page.locator(date_selector)
+                date_val = date_el.text_content().strip() if date_el.count() > 0 else ""
+                print(f"[DEBUG] Столбец 3 (Дата): '{date_val}'")
+
+                # Столбец 4: Оператор
+                operator_selector = f"tbody.q-virtual-scroll__content tr:nth-child({nth}) td:nth-child(4) div.student_table__field-value"
+                operator_el = page.locator(operator_selector)
+                operator_val = operator_el.text_content().strip() if operator_el.count() > 0 else ""
+                print(f"[DEBUG] Столбец 4 (Оператор): '{operator_val}'")
+
+                # Маппинг
+                target_model = model_mapping.get(doc_title)
+                model_name = target_model.__name__ if target_model else "НЕ НАЙДЕНА В СЛОВАРЕ"
+                print(f"[DEBUG] Маппинг текста '{doc_title}' -> Модель: {model_name}")
+
+                if not doc_title:
+                    print(f"[DEBUG] Пустое название документа, пропускаю строку {nth}")
+                    continue
+
+                doc_data = RouteDocumentData(
+                    name=doc_title,
+                    is_checked=is_checked,
+                    date_text=date_val or None,
+                    operator=operator_val or None,
+                )
+                results.append(doc_data)
+
+                # Маппинг и лог сохранения (фактическое сохранение — в save_student_to_db)
+                if target_model:
+                    print(f"[DEBUG] Будет сохранено в {target_model.__name__}: is_checked={is_checked}, date={date_val!r}, operator={operator_val!r}")
+                else:
+                    print(f"[DEBUG] Модель для '{doc_title}' не найдена в маппинге, сохранение пропущено")
+
+            except Exception as e:
+                print(f"[ERROR] Ошибка на строке {idx + 1}: {e}")
+                traceback.print_exc()
+                continue
+
+    except Exception as e:
+        print(f"[scraper] Error parsing route table: {e}")
+        traceback.print_exc()
+
+    print(f"[DEBUG] Всего распарсенных документов маршрута: {len(results)}")
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Main dialog parser
+# ---------------------------------------------------------------------------
 
 def parse_student_dialog(page: Page, config: Dict[str, Any]) -> Optional[StudentData]:
     """
-    Parses the open student dialog. Assumes dialog is already loaded and visible.
-    Called after the main loop confirms dialog readiness via polling.
+    Parses the open student dialog:
+    1. Main tab: ФИО, ID, email, course, document scans + PDF downloads
+    2. Switches to Маршрут tab, parses route table
+    3. Returns StudentData with all extracted info
     """
     full_name_selector = "div.cursor-pointer.text-center"
-
     data = StudentData()
 
     try:
-        # --- ФИО from header ---
+        # --- Main tab: basic info ---
         full_name_el = page.query_selector(full_name_selector)
         if full_name_el:
             full_name = full_name_el.inner_text().strip()
             if full_name:
                 data.last_name, data.first_name, data.patronymic = _parse_full_name(full_name)
 
-        # --- Student ID ---
         id_el = page.query_selector(".student_dialog__menu-footer__id")
         if id_el:
             data.student_id = id_el.inner_text().strip()
 
-        # --- Email from footer ---
         email_el = page.query_selector(".student_dialog__menu-footer__email")
         if email_el:
             data.email = email_el.inner_text().strip()
 
-        # --- Course from footer ---
         course_el = page.query_selector(".student_dialog__menu-footer__course")
         if course_el:
             data.course = course_el.inner_text().strip()
@@ -566,7 +695,6 @@ def parse_student_dialog(page: Page, config: Dict[str, Any]) -> Optional[Student
 
         for label_text, attr_prefix in doc_configs:
             has_file = _check_file_input_has_value(page, label_text)
-            setattr(data, f"has_{attr_prefix}_scan", has_file)
 
             if has_file:
                 result = _download_file_from_row(page, label_text)
@@ -578,42 +706,14 @@ def parse_student_dialog(page: Page, config: Dict[str, Any]) -> Optional[Student
                 else:
                     print(f"[scraper] Failed to download {label_text}")
 
-        # --- Click "Учет" tab to access enrollment data ---
-        tabs_list = page.query_selector(".tabs-list")
-        if tabs_list:
-            tab_items = tabs_list.query_selector_all(".q-item")
-            for tab_item in tab_items:
-                tab_text = tab_item.inner_text().strip()
-                if tab_text == "Учет":
-                    try:
-                        tab_item.click()
-                        page.wait_for_timeout(500)
-                    except Exception:
-                        pass
-                    break
+        # --- Switch to Маршрут tab and parse route table ---
+        if _switch_to_route_tab(page, email=data.email or ""):
+            page.wait_for_timeout(500)
+            data.route_documents = _parse_route_table(page, student_id=data.student_id or "")
+        else:
+            print("[scraper] Could not switch to Маршрут tab, skipping route parsing")
 
-        # --- Enrollment documents via row filter + input value ---
-        data.has_enrollment_application = _check_file_input_has_value(page, "Заявление на зачисление")
-        data.has_personal_data_consent = _check_file_input_has_value(page, "Согласие на обработку персональных данных")
-
-        # --- Route metadata ---
-        status_val = _extract_field_value(page, "Статус")
-        if status_val:
-            data.route_status = _map_route_status(status_val)
-
-        uploaded_val = _extract_field_value(page, "Дата подгрузки")
-        if uploaded_val:
-            data.uploaded_at = _parse_datetime(uploaded_val)
-
-        operator_val = _extract_field_value(page, "Оператор")
-        if operator_val:
-            data.operator = operator_val
-
-        verified_val = _extract_field_value(page, "Дата проверки")
-        if verified_val:
-            data.verified_at = _parse_datetime(verified_val)
-
-        # --- Collect all raw fields for debugging ---
+        # --- Collect raw fields for debugging ---
         rows = page.query_selector_all(".student_info__row")
         for row in rows:
             title_el = row.query_selector(".student_info__row-title")
@@ -636,13 +736,28 @@ def parse_student_dialog(page: Page, config: Dict[str, Any]) -> Optional[Student
 
     except Exception as e:
         print(f"[scraper] Error parsing dialog: {e}")
+        traceback.print_exc()
 
     return data
 
 
 # ---------------------------------------------------------------------------
-# Main scraper — sync with direct Django ORM calls
+# Main scraper
 # ---------------------------------------------------------------------------
+
+def _close_dialog_and_wait(page: Page):
+    """Closes dialog and waits for main table to stabilize."""
+    try:
+        page.keyboard.press("Escape")
+        page.wait_for_selector(
+            "tbody.q-virtual-scroll__content",
+            state="visible",
+            timeout=10000,
+        )
+        page.wait_for_timeout(500)
+    except Exception:
+        pass
+
 
 def run_scraper(
     config_path: str = "scraper_config.yaml",
@@ -656,16 +771,13 @@ def run_scraper(
     2. Navigate → localStorage → reload
     3. Collect unique emails
     4. For each email:
-       a. cell = page.locator("table.q-table td").filter(has_text=email).first
-       b. cell.scroll_into_view_if_needed()
-       c. cell.click()
-       d. Wait for dialog (5 attempts, 2s each)
-       e. parse_student_dialog() (dialog already confirmed loaded)
-       f. save_student_to_db(data)  ← direct sync Django ORM call
-       g. page.keyboard.press("Escape")
-       h. wait_for_selector(tbody, state='visible') + 500ms  ← dynamic table reload
+       a. Click cell → open dialog
+       b. Wait for dialog (5 attempts × 2s)
+       c. Parse main tab + download PDFs
+       d. Switch to Маршрут tab → parse route table
+       e. save_student_to_db(data)
+       f. Escape → wait for table reload
     """
-    # Allow sync ORM calls from Playwright's sync context
     import os
     os.environ.setdefault("DJANGO_ALLOW_ASYNC_UNSAFE", "true")
 
@@ -685,24 +797,19 @@ def run_scraper(
             "https://edu.firpo.ru/jM5a-1Pq8/students",
         )
 
-        # --- Navigate ---
         print(f"[scraper] Navigating to students page: {students_url}")
         page.goto(students_url, wait_until="domcontentloaded", timeout=60000)
         page.wait_for_load_state("networkidle", timeout=60000)
 
-        # --- Inject localStorage preset ---
         inject_localstorage_preset(page, config)
 
-        # --- Reload so Quasar picks up the new limit ---
         print("[scraper] Reloading page to apply localStorage preset...")
         page.reload(wait_until="domcontentloaded", timeout=60000)
         page.wait_for_load_state("networkidle", timeout=60000)
         time.sleep(2)
 
-        # --- Collect unique emails ---
         emails = collect_unique_emails(page, config)
 
-        # --- Test mode: limit to first 10 students ---
         if test_mode:
             print("[scraper] Running in TEST mode. Processing only the first 10 students.")
             emails = emails[:10]
@@ -713,26 +820,21 @@ def run_scraper(
             print("[scraper] No emails collected. Stopping.")
             return students
 
-        # --- Main cycle ---
         for idx, email in enumerate(emails):
             try:
                 print(f"[scraper] [{idx + 1}/{total}] Processing student with email: {email}")
 
-                # Step 1: Find td cell with this email directly
                 cell = page.locator("table.q-table td").filter(has_text=email).first
 
                 if cell.count() == 0:
                     print(f"[scraper] [{idx + 1}/{total}] Cell not found for email: {email}")
                     continue
 
-                # Step 2: Scroll into view
                 cell.scroll_into_view_if_needed()
                 page.wait_for_timeout(300)
-
-                # Step 3: Click the cell
                 cell.click()
 
-                # Step 4: Wait for dialog to load — exactly 5 attempts per student
+                # Wait for dialog — exactly 5 attempts per student
                 dialog_loaded = False
                 for attempt in range(1, 6):
                     print(f"[scraper] [{idx + 1}/{total}] Checking dialog load. Attempt {attempt}/5...")
@@ -746,34 +848,22 @@ def run_scraper(
                         page.wait_for_timeout(2000)
 
                 if not dialog_loaded:
-                    print(f"[scraper] [{idx + 1}/{total}] Dialog did not load after 5 attempts. Skipping this student.")
-                    try:
-                        page.keyboard.press("Escape")
-                        page.wait_for_selector("tbody.q-virtual-scroll__content", state="visible", timeout=10000)
-                        page.wait_for_timeout(500)
-                    except Exception:
-                        pass
+                    print(f"[scraper] [{idx + 1}/{total}] Dialog did not load after 5 attempts. Skipping.")
+                    _close_dialog_and_wait(page)
                     continue
 
-                # Step 5: Parse dialog (already confirmed loaded)
                 student_data = parse_student_dialog(page, config)
 
                 if student_data is None:
-                    print(
-                        f"[scraper] [{idx + 1}/{total}] "
-                        f"Skipped (dialog parse returned None). Email: {email}"
-                    )
-                    page.keyboard.press("Escape")
-                    page.wait_for_selector("tbody.q-virtual-scroll__content", state="visible", timeout=10000)
-                    page.wait_for_timeout(500)
+                    print(f"[scraper] [{idx + 1}/{total}] Skipped (dialog parse returned None).")
+                    _close_dialog_and_wait(page)
                     continue
 
                 if student_data and student_data.first_name:
                     students.append(student_data)
 
-                    # Step 6: Save to Django DB
                     try:
-                        student_obj, route_obj, created = save_student_to_db(student_data)
+                        student_obj, created = save_student_to_db(student_data)
                         action = "Created" if created else "Updated"
                         print(
                             f"[scraper] [{idx + 1}/{total}] "
@@ -781,34 +871,19 @@ def run_scraper(
                         )
                     except Exception as db_err:
                         print(f"[scraper] [{idx + 1}/{total}] DB save error: {db_err}")
+                        traceback.print_exc()
 
                     if on_student:
                         on_student(student_data)
                 else:
-                    print(
-                        f"[scraper] [{idx + 1}/{total}] "
-                        f"Skipped (no name in dialog). Email: {email}"
-                    )
+                    print(f"[scraper] [{idx + 1}/{total}] Skipped (no name in dialog).")
 
-                # Step 7: Close dialog via Escape
-                page.keyboard.press("Escape")
-
-                # Step 8: Dynamic wait for table to reload
-                print("[scraper] Waiting for virtual scroll content to reload and stabilize...")
-                page.wait_for_selector(
-                    "tbody.q-virtual-scroll__content",
-                    state="visible",
-                    timeout=10000,
-                )
-                page.wait_for_timeout(500)
+                _close_dialog_and_wait(page)
 
             except Exception as e:
-                print(f"[scraper] [{idx + 1}/{total}] Error: {e}")
-                try:
-                    page.keyboard.press("Escape")
-                    page.wait_for_timeout(5000)
-                except Exception:
-                    pass
+                print(f"[scraper] [{idx + 1}/{total}] Critical error: {e}")
+                traceback.print_exc()
+                _close_dialog_and_wait(page)
                 continue
 
     finally:
@@ -825,10 +900,7 @@ def run_scraper_single(
     *,
     on_student: Optional[Callable[[StudentData], None]] = None,
 ) -> Optional[StudentData]:
-    """
-    Scrape a single student by ID or the first email.
-    """
-    # Allow sync ORM calls from Playwright's sync context
+    """Scrape a single student by ID or the first email."""
     import os
     os.environ.setdefault("DJANGO_ALLOW_ASYNC_UNSAFE", "true")
 
@@ -897,7 +969,6 @@ def run_scraper_single(
         page.wait_for_timeout(300)
         cell.click()
 
-        # Wait for dialog to load — exactly 5 attempts
         dialog_loaded = False
         for attempt in range(1, 6):
             print(f"[scraper] Checking dialog load. Attempt {attempt}/5...")
@@ -921,12 +992,13 @@ def run_scraper_single(
         student_data = parse_student_dialog(page, config)
 
         if student_data is None:
-            print("[scraper] Dialog did not load.")
+            print("[scraper] Dialog parse returned None.")
+            _close_dialog_and_wait(page)
             return None
 
         if student_data and student_data.first_name:
             try:
-                student_obj, route_obj, created = save_student_to_db(student_data)
+                student_obj, created = save_student_to_db(student_data)
                 action = "Created" if created else "Updated"
                 print(f"[scraper] {action} in DB: {student_data.last_name} {student_data.first_name}")
             except Exception as db_err:
@@ -935,11 +1007,7 @@ def run_scraper_single(
             if on_student:
                 on_student(student_data)
 
-        page.keyboard.press("Escape")
-
-        print("[scraper] Waiting for virtual scroll content to reload and stabilize...")
-        page.wait_for_selector("tbody.q-virtual-scroll__content", state="visible", timeout=10000)
-        page.wait_for_timeout(500)
+        _close_dialog_and_wait(page)
 
         return student_data
 

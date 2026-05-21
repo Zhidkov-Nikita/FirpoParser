@@ -1,41 +1,44 @@
 from django.db import models
-from django.utils.timezone import now
 
 
 class Student(models.Model):
     """
-    Модель Обучаемого и его личных сведений (наличие/отсутствие документов).
+    Модель Обучаемого и его личных сведений.
     """
-    # Личные сведения
+    student_id = models.CharField(
+        'ID Студента',
+        max_length=50,
+        default='',
+        db_index=True,
+        help_text='Уникальный ID студента из системы FIRPO'
+    )
     first_name = models.CharField('Имя', max_length=150)
     last_name = models.CharField('Фамилия', max_length=150)
     patronymic = models.CharField('Отчество', max_length=150, blank=True, null=True)
-    
-    # Скан-документы (FileField для физического хранения файлов)
+    email = models.EmailField('Email', blank=True, null=True)
+    course = models.CharField('Курс', max_length=255, blank=True, null=True)
+
     passport_file = models.FileField(
         'Скан паспорта',
         upload_to='passports/',
         blank=True,
         null=True,
-        help_text='Файл скана паспорта'
     )
     name_change_file = models.FileField(
         'Скан документа о смене ФИО',
         upload_to='name_changes/',
         blank=True,
         null=True,
-        help_text='Файл скана документа о смене ФИО'
     )
     education_file = models.FileField(
         'Скан документа об образовании',
         upload_to='education/',
         blank=True,
         null=True,
-        help_text='Файл скана документа об образовании'
     )
 
-    created_at = models.DateTimeField('Дата создания записи', auto_now_add=True)
-    updated_at = models.DateTimeField('Дата обновления записи', auto_now=True)
+    created_at = models.DateTimeField('Дата создания', auto_now_add=True)
+    updated_at = models.DateTimeField('Дата обновления', auto_now=True)
 
     class Meta:
         verbose_name = 'Обучаемый'
@@ -46,64 +49,58 @@ class Student(models.Model):
         return f"{self.last_name} {self.first_name} {self.patronymic or ''}".strip()
 
 
-class EnrollmentRoute(models.Model):
+class _RouteDocumentBase(models.Model):
     """
-    Модель Учет -> Маршруты.
-    Хранит информацию о заявлениях, документах и статусах их проверки.
+    Абстрактная базовая модель для документов маршрута.
     """
-    class StatusChoices(models.TextChoices):
-        NEW = 'new', 'Новое'
-        IN_PROGRESS = 'in_progress', 'На проверке'
-        APPROVED = 'approved', 'Одобрено'
-        REJECTED = 'rejected', 'Отклонено'
-
     student = models.OneToOneField(
         Student,
         on_delete=models.CASCADE,
-        related_name='route',
-        verbose_name='Обучаемый'
+        related_name='%(class)s',
+        verbose_name='Обучаемый',
     )
-    
-    # Первичные документы (Логические флаги подгрузки/наличия в маршруте)
-    has_enrollment_application = models.BooleanField(
-        'Заявление на зачисление', 
-        default=False
-    )
-    has_personal_data_consent = models.BooleanField(
-        'Согласие на обработку ПДн', 
-        default=False
-    )
-    
-    # Данные проверки и логистики
-    status = models.CharField(
-        'Статус',
-        max_length=20,
-        choices=StatusChoices.choices,
-        default=StatusChoices.NEW,
-        db_index=True  # Индекс для быстрой фильтрации в админке по статусам
-    )
-    uploaded_at = models.DateTimeField(
-        'Дата и время подгрузки',
-        default=now,
-        db_index=True  # Индекс для сортировки по времени загрузки парсером
-    )
-    operator = models.CharField(
-        'Оператор проверки',
-        max_length=150,
-        blank=True,
-        null=True,
-        help_text='ФИО или ID оператора, проверившего документы'
-    )
-    verified_at = models.DateTimeField(
-        'Дата и время проверки',
-        blank=True,
-        null=True
-    )
+    is_checked = models.BooleanField('Статус проверки', default=False)
+    date_text = models.CharField('Дата', max_length=100, blank=True, null=True)
+    operator = models.CharField('Оператор', max_length=255, blank=True, null=True)
 
     class Meta:
-        verbose_name = 'Маршрут учета'
-        verbose_name_plural = 'Маршруты учета'
-        ordering = ['-uploaded_at']
+        abstract = True
+        ordering = ['-student__created_at']
 
     def __str__(self):
-        return f"Маршрут для {self.student} (Статус: {self.get_status_display()})"
+        return f"{self._meta.verbose_name} — {self.student}"
+
+
+class CourseEnrollment(_RouteDocumentBase):
+    """Поступление на курс."""
+    class Meta(_RouteDocumentBase.Meta):
+        verbose_name = 'Поступление на курс'
+        verbose_name_plural = 'Поступления на курс'
+
+
+class PersonalDataConsent(_RouteDocumentBase):
+    """Согласие на обработку персональных данных."""
+    class Meta(_RouteDocumentBase.Meta):
+        verbose_name = 'Согласие на обработку ПДн'
+        verbose_name_plural = 'Согласия на обработку ПДн'
+
+
+class EnrollmentApplication(_RouteDocumentBase):
+    """Заявление на зачисление."""
+    class Meta(_RouteDocumentBase.Meta):
+        verbose_name = 'Заявление на зачисление'
+        verbose_name_plural = 'Заявления на зачисление'
+
+
+class EducationContract(_RouteDocumentBase):
+    """Договор на обучение."""
+    class Meta(_RouteDocumentBase.Meta):
+        verbose_name = 'Договор на обучение'
+        verbose_name_plural = 'Договоры на обучение'
+
+
+class PrimaryDocuments(_RouteDocumentBase):
+    """Первичные документы."""
+    class Meta(_RouteDocumentBase.Meta):
+        verbose_name = 'Первичные документы'
+        verbose_name_plural = 'Первичные документы'
