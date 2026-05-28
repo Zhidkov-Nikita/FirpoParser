@@ -1,4 +1,5 @@
 from django.contrib import admin
+from django.utils.html import format_html
 from .models import (
     Student,
     CourseEnrollment,
@@ -54,13 +55,12 @@ class StudentAdmin(admin.ModelAdmin):
         'get_full_name',
         'email',
         'course',
+        'colored_status',
         'has_passport_file',
         'has_education_file',
     )
     list_filter = (
-        'passport_file',
-        'education_file',
-        'name_change_file',
+        'status',
     )
     search_fields = (
         'student_id',
@@ -81,6 +81,26 @@ class StudentAdmin(admin.ModelAdmin):
     @admin.display(description='ФИО')
     def get_full_name(self, obj):
         return f"{obj.last_name} {obj.first_name} {obj.patronymic or ''}".strip()
+
+    @admin.display(description='Статус')
+    def colored_status(self, obj):
+        if not obj.status:
+            return ""
+        colors = {
+            "Услуга прекращена": "red",
+            "Прошёл ИА": "green",
+            "Обучается": "green",
+            "Заключен 3-х сторонний": "purple",
+            "Заключен договор": "purple",
+            "Подписан СЭП": "orange",
+            "Заявка одобрена": "orange",
+            "Новая заявка": "gray",
+        }
+        color = colors.get(obj.status, "gray")
+        return format_html(
+            '<span style="color: {}; font-weight: bold;">{}</span>',
+            color, obj.status,
+        )
 
     @admin.display(description='Паспорт', boolean=True)
     def has_passport_file(self, obj):

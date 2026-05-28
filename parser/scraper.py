@@ -13,7 +13,7 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Union
 
 import yaml
 from playwright.sync_api import (
@@ -35,6 +35,7 @@ class RouteDocumentData:
     is_checked: bool = False
     date_text: Optional[str] = None
     operator: Optional[str] = None
+    status_value: Optional[Union[bool, str]] = None
 
 
 @dataclass
@@ -556,88 +557,98 @@ def _switch_to_route_tab(page: Page, email: str = "") -> bool:
     return False
 
 
+def _parse_status_cell(td) -> Optional[Union[bool, str]]:
+    """
+    Универсальный сбор статуса из ячейки (2-й столбец).
+    Возвращает True/False/"X"/None.
+    """
+    try:
+        img = td.locator("img").first
+        if img.count() > 0:
+            src = img.get_attribute("src") or ""
+            src_lower = src.lower()
+            if "square-check" in src_lower:
+                return True
+            if "square-x" in src_lower or "square-close" in src_lower:
+                return "X"
+            return False
+
+        toggle = td.locator(".q-toggle").first
+        if toggle.count() > 0:
+            aria = toggle.get_attribute("aria-checked")
+            if aria == "true":
+                return True
+            return False
+
+        text = td.text_content()
+        if text:
+            text = text.strip()
+            if "%" in text:
+                try:
+                    pct = int(text.replace("%", "").strip())
+                    return pct > 0
+                except (ValueError, TypeError):
+                    return False
+        return False
+    except Exception:
+        return False
+
+
 def _parse_route_table(page: Page, student_id: str = "") -> List[RouteDocumentData]:
     """
-    Parses the first 5 rows of the Маршрут table with detailed debug logging.
+    Парсит ВСЕ строки таблицы Маршрут с универсальным определением статуса.
+    Возвращает список RouteDocumentData для сохранения в БД.
     """
-    from parser.models import (
-        CourseEnrollment,
-        EducationContract,
-        EnrollmentApplication,
-        PersonalDataConsent,
-        PrimaryDocuments,
-    )
-
     results: List[RouteDocumentData] = []
 
-    model_mapping = {
-        "Поступление на курс": CourseEnrollment,
-        "Согласие на обработку персональных данных": PersonalDataConsent,
-        "Заявление на зачисление": EnrollmentApplication,
-        "Договор на обучение": EducationContract,
-        "Первичные документы": PrimaryDocuments,
-    }
-
     try:
-        rows_count = page.locator("tbody.q-virtual-scroll__content tr").count()
+        rows = page.locator("tbody.q-virtual-scroll__content tr")
+        rows_count = rows.count()
         print(f"[DEBUG] Всего tr найдено во внутреннем скролле: {rows_count}")
 
         if rows_count == 0:
             print("[DEBUG] Нет строк в таблице маршрута")
             return results
 
-        for idx in range(min(5, rows_count)):
-            print(f"--- Обработка строки {idx + 1} из 5 ---")
+        for idx in range(rows_count):
+            print(f"--- Обработка строки {idx + 1} из {rows_count} ---")
             try:
-                nth = idx + 1
+                row = rows.nth(idx)
 
                 # Столбец 1: Название документа
-                doc_title_selector = f"tbody.q-virtual-scroll__content tr:nth-child({nth}) td:nth-child(1) div.student_table__field-value"
-                doc_title_el = page.locator(doc_title_selector)
-                doc_title = doc_title_el.text_content().strip() if doc_title_el.count() > 0 else ""
-                print(f"[DEBUG] Столбец 1 (Название документа): '{doc_title}'")
+                name_el = row.locator("td:nth-child(1) div.student_table__field-value")
+                doc_title = name_el.text_content().strip() if name_el.count() > 0 else ""
+                print(f"[DEBUG] Столбец 1 (Название): '{doc_title}'")
 
-                # Столбец 2: Картинка статуса
-                img_selector = f"tbody.q-virtual-scroll__content tr:nth-child({nth}) td:nth-child(2) img"
-                img_element = page.locator(img_selector)
-                img_src = img_element.get_attribute("src") if img_element.count() > 0 else "НЕТ_КАРТИНКИ"
-                print(f"[DEBUG] Столбец 2 (src картинки): '{img_src}'")
-                is_checked = "check" in img_src.lower() if img_src != "НЕТ_КАРТИНКИ" else False
+                if not doc_title:
+                    print(f"[DEBUG] Пустое название документа, пропускаю строку {idx + 1}")
+                    continue
+
+                # Столбец 2: Универсальный сбор статуса
+                td2 = row.locator("td:nth-child(2)")
+                status_value = _parse_status_cell(td2)
+                is_checked = status_value is True
+                print(f"[DEBUG] Столбец 2 (статус): status_value={status_value!r}, is_checked={is_checked}")
 
                 # Столбец 3: Дата
-                date_selector = f"tbody.q-virtual-scroll__content tr:nth-child({nth}) td:nth-child(3) div.student_table__field-value"
-                date_el = page.locator(date_selector)
+                date_el = row.locator("td:nth-child(3) div.student_table__field-value")
                 date_val = date_el.text_content().strip() if date_el.count() > 0 else ""
                 print(f"[DEBUG] Столбец 3 (Дата): '{date_val}'")
 
                 # Столбец 4: Оператор
-                operator_selector = f"tbody.q-virtual-scroll__content tr:nth-child({nth}) td:nth-child(4) div.student_table__field-value"
-                operator_el = page.locator(operator_selector)
-                operator_val = operator_el.text_content().strip() if operator_el.count() > 0 else ""
+                op_el = row.locator("td:nth-child(4) div.student_table__field-value")
+                operator_val = op_el.text_content().strip() if op_el.count() > 0 else ""
                 print(f"[DEBUG] Столбец 4 (Оператор): '{operator_val}'")
-
-                # Маппинг
-                target_model = model_mapping.get(doc_title)
-                model_name = target_model.__name__ if target_model else "НЕ НАЙДЕНА В СЛОВАРЕ"
-                print(f"[DEBUG] Маппинг текста '{doc_title}' -> Модель: {model_name}")
-
-                if not doc_title:
-                    print(f"[DEBUG] Пустое название документа, пропускаю строку {nth}")
-                    continue
 
                 doc_data = RouteDocumentData(
                     name=doc_title,
                     is_checked=is_checked,
                     date_text=date_val or None,
                     operator=operator_val or None,
+                    status_value=status_value,
                 )
                 results.append(doc_data)
-
-                # Маппинг и лог сохранения (фактическое сохранение — в save_student_to_db)
-                if target_model:
-                    print(f"[DEBUG] Будет сохранено в {target_model.__name__}: is_checked={is_checked}, date={date_val!r}, operator={operator_val!r}")
-                else:
-                    print(f"[DEBUG] Модель для '{doc_title}' не найдена в маппинге, сохранение пропущено")
+                print(f"[DEBUG] Добавлен документ: {doc_title} (is_checked={is_checked})")
 
             except Exception as e:
                 print(f"[ERROR] Ошибка на строке {idx + 1}: {e}")
@@ -650,6 +661,50 @@ def _parse_route_table(page: Page, student_id: str = "") -> List[RouteDocumentDa
 
     print(f"[DEBUG] Всего распарсенных документов маршрута: {len(results)}")
     return results
+
+
+def _build_route_steps(route_docs: List[RouteDocumentData]) -> Dict[str, Dict]:
+    steps = {}
+    for doc in route_docs:
+        steps[doc.name] = {
+            "value": doc.status_value if doc.status_value is not None else doc.is_checked,
+            "operator": doc.operator or "",
+        }
+    return steps
+
+
+def _compute_student_status(route_docs: List[RouteDocumentData]) -> str:
+    route_steps = _build_route_steps(route_docs)
+
+    # --- 1. КРИТИЧЕСКИЕ И СИСТЕМНЫЕ МАРКЕРЫ ---
+    expelled = route_steps.get("Отчислен", {}).get("value")
+    if expelled == "X" or expelled is True:
+        return "Услуга прекращена"
+
+    if route_steps.get("Выпуск", {}).get("value") is True:
+        return "Прошёл ИА"
+
+    if route_steps.get("Зачислен на курс", {}).get("value") is True:
+        return "Обучается"
+
+    # --- 2. ЛИНЕЙНАЯ ЦЕПОЧКА ДОКУМЕНТОВ (снизу вверх) ---
+    contract = route_steps.get("Договор на обучение", {})
+    if contract.get("value") is True:
+        operator_text = str(contract.get("operator", ""))
+        if "3-х" in operator_text or "трех" in operator_text.lower():
+            return "Заключен 3-х сторонний"
+        return "Заключен договор"
+
+    if route_steps.get("Согласие на обработку персональных данных.", {}).get("value") is True:
+        return "Подписан СЭП"
+
+    if route_steps.get("Заявление на зачисление", {}).get("value") is True:
+        return "Заявка одобрена"
+
+    if route_steps.get("Поступление на курс", {}).get("value") is True:
+        return "Новая заявка"
+
+    return "Статус не определен"
 
 
 # ---------------------------------------------------------------------------
@@ -869,6 +924,11 @@ def run_scraper(
                             f"[scraper] [{idx + 1}/{total}] "
                             f"{action} in DB: {student_data.last_name} {student_data.first_name} ({email})"
                         )
+
+                        status_text = _compute_student_status(student_data.route_documents)
+                        student_obj.status = status_text
+                        student_obj.save(update_fields=['status'])
+                        print(f"[scraper] [{idx + 1}/{total}] Status: {status_text}")
                     except Exception as db_err:
                         print(f"[scraper] [{idx + 1}/{total}] DB save error: {db_err}")
                         traceback.print_exc()
@@ -1001,6 +1061,11 @@ def run_scraper_single(
                 student_obj, created = save_student_to_db(student_data)
                 action = "Created" if created else "Updated"
                 print(f"[scraper] {action} in DB: {student_data.last_name} {student_data.first_name}")
+
+                status_text = _compute_student_status(student_data.route_documents)
+                student_obj.status = status_text
+                student_obj.save(update_fields=['status'])
+                print(f"[scraper] Status: {status_text}")
             except Exception as db_err:
                 print(f"[scraper] DB save error: {db_err}")
 

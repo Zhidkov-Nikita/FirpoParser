@@ -17,7 +17,7 @@ from .models import (
     EducationContract,
     PrimaryDocuments,
 )
-from .scraper import StudentData, ROUTE_MODEL_MAPPING
+from .scraper import StudentData, ROUTE_MODEL_MAPPING, _compute_student_status
 
 
 def save_student_to_db(data: StudentData) -> tuple:
@@ -90,5 +90,9 @@ def save_student_to_db(data: StudentData) -> tuple:
                     "operator": route_doc.operator,
                 },
             )
+
+        status_text = _compute_student_status(data.route_documents)
+        student.status = status_text
+        student.save(update_fields=['status'])
 
     return student, student_created

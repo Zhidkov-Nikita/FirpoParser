@@ -17,6 +17,7 @@ class Student(models.Model):
     patronymic = models.CharField('Отчество', max_length=150, blank=True, null=True)
     email = models.EmailField('Email', blank=True, null=True)
     course = models.CharField('Курс', max_length=255, blank=True, null=True)
+    status = models.CharField('Текущий статус', max_length=100, blank=True, null=True, db_index=True)
 
     passport_file = models.FileField(
         'Скан паспорта',
