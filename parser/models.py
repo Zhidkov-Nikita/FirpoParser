@@ -47,10 +47,6 @@ class Student(models.Model):
         verbose_name_plural = 'Обучаемые'
         ordering = ['-created_at']
 
-    def save(self, *args, **kwargs):
-        if self.student_id and not self.student_id_irpo:
-            self.student_id_irpo = self.student_id
-        super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.last_name} {self.first_name} {self.patronymic or ''}".strip()
@@ -69,6 +65,16 @@ class _RouteDocumentBase(models.Model):
     is_checked = models.BooleanField('Статус проверки', default=False)
     date_text = models.CharField('Дата', max_length=100, blank=True, null=True)
     operator = models.CharField('Оператор', max_length=255, blank=True, null=True)
+    student_id_irpo = models.CharField('ID студента', blank=True, null=True)
+
+    def save(self, *args, **kwargs):
+        # Проверяем, привязан ли студент, и не заполнено ли уже поле student_id_irpo документа
+        if self.student and not self.student_id_irpo:
+            # Берем ID из модели Student (пробуем student_id_irpo, если пусто — берем student_id)
+            self.student_id_irpo = self.student.student_id_irpo
+            
+        super().save(*args, **kwargs)
+
 
     class Meta:
         abstract = True
