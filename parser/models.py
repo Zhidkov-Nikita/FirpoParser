@@ -18,6 +18,7 @@ class Student(models.Model):
     email = models.EmailField('Email', blank=True, null=True)
     course = models.CharField('Курс', max_length=255, blank=True, null=True)
     status = models.CharField('Текущий статус', max_length=100, blank=True, null=True, db_index=True)
+    student_id_irpo = models.CharField('ID студента', blank=True, null=True)
 
     passport_file = models.FileField(
         'Скан паспорта',
@@ -45,6 +46,11 @@ class Student(models.Model):
         verbose_name = 'Обучаемый'
         verbose_name_plural = 'Обучаемые'
         ordering = ['-created_at']
+
+    def save(self, *args, **kwargs):
+        if self.student_id and not self.student_id_irpo:
+            self.student_id_irpo = self.student_id
+        super().save(*args, **kwargs)
 
     def __str__(self):
         return f"{self.last_name} {self.first_name} {self.patronymic or ''}".strip()
